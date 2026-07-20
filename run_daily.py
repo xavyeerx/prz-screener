@@ -1,4 +1,5 @@
-﻿import argparse
+import argparse
+import html
 import sys
 import os
 
@@ -158,15 +159,14 @@ def main(argv=None):
                     continue
                 bb = r.best_buy
                 last_close = r.realtime_close if r.realtime_close is not None else float(r.df["Close"].iloc[-1])
+                valid_str = "\u2705 valid" if bb.valid else "\u26a0\ufe0f invalid"
                 inside = bb.prz_lo <= last_close <= bb.prz_hi
-                status = "INSIDE PRZ" if inside else f"approaching {bb.dist_pct:.1f}%"
+                status_disp = "\U0001f4cd INSIDE PRZ" if inside else f"approaching {bb.dist_pct:.1f}% \U0001f53d"
                 caption = (
-                    f"<b>{r.ticker}</b> | Daily | {bb.pattern} | "
-                    f"{'✅ valid' if bb.valid else '⚠️ invalid'}\n"
-                    f"PRZ: <code>{bb.prz_lo:.0f} - {bb.prz_hi:.0f}</code>  "
-                    f"Close: <code>{last_close:.0f}</code>\n"
-                    f"{status}  |  Score: <code>{bb.score:.0f}</code>\n"
-                    f"TP1: <code>{bb.tp1:.0f}</code>  Stop: <code>{bb.stop:.0f}</code>"
+                    f"<b>{html.escape(r.ticker)}</b> | Daily | {html.escape(bb.pattern)} | {valid_str}\n"
+                    f"PRZ: <code>{bb.prz_lo:.0f} - {bb.prz_hi:.0f}</code>\n"
+                    f"Close: <code>{last_close:.0f}</code> | {status_disp}\n"
+                    f"Score: <code>{bb.score:.0f}</code> | TP1: <code>{bb.tp1:.0f}</code> | Stop: <code>{bb.stop:.0f}</code>"
                 )
                 print(f"  [TG] Mengirim {r.ticker}...")
                 ok = tg.send_photo(path, caption)

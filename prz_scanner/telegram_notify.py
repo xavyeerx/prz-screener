@@ -1,17 +1,12 @@
-﻿"""Telegram notification module for PRZ Scanner.
+"""Telegram notification module for PRZ Scanner.
 
 Sends scan results (summary text + chart PNGs) to a Telegram group/chat.
 
 Credentials are loaded from .env (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID),
 or can be passed directly to TelegramSender().
-
-Usage:
-    tg = TelegramSender()          # loads from .env
-    tg.send_summary(df, timeframe) # send summary table
-    tg.send_chart(png_path, caption) # send one chart image
-    tg.send_results(results, df, timeframe, out_dir) # all-in-one
 """
 
+import html
 import os
 import time
 from typing import Optional, List
@@ -22,9 +17,18 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv optional; fall back to os.environ
+    pass
 
 from .scanner import StockResult
+
+
+def _e(val) -> str:
+    """HTML-escape a value so it's safe inside Telegram HTML parse_mode.
+
+    Escapes &, <, > — wajib untuk semua nilai dinamis (ticker, angka, dll.)
+    agar tidak menyebabkan 400 Bad Request dari Telegram API.
+    """
+    return html.escape(str(val))
 
 
 class TelegramSender:
@@ -49,9 +53,11 @@ class TelegramSender:
     def _url(self, method: str) -> str:
         return self.BASE_URL.format(token=self.token, method=method)
 
-    def _post(self, method: str, data: dict = None, files=None, timeout: int = 30) -> dict:
-        """POST to Telegram API, raise on HTTP error."""
-        r = requests.post(self._url(method), data=data, files=files, timeout=timeout)
+    def _post(self, method: str, data: dict = None, files=None,
+              timeout: int = 30) -> dict:
+        """POST to Telegram API."""
+        r = requests.post(self._url(method), data=data, files=files,
+                          timeout=timeout)
         r.raise_for_status()
         resp = r.json()
         if not resp.get("ok"):
@@ -59,7 +65,8 @@ class TelegramSender:
         return resp
 
     def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send a plain text (or HTML) message."""
+        """Send a text message. Falls back to plain text if HTML fails (400)."""
+        # Attempt 1: with parse_mode (HTML)
         try:
             self._post("sendMessage", data={
                 "chat_id": self.chat_id,
@@ -68,22 +75,53 @@ class TelegramSender:
             })
             return True
         except Exception as e:
+            err_str = str(e)
+            # 400 = parse error in HTML → retry without parse_mode
+            if "400" in err_str and parse_mode:
+                print(f"  [TG] HTML parse error, retry sebagai plain text...")
+                try:
+                    # Strip HTML tags for plain text fallback
+                    import re
+                    plain = re.sub(r"<[^>]+>", "", text)
+                    self._post("sendMessage", data={
+                        "chat_id": self.chat_id,
+                        "text": plain,
+                    })
+                    return True
+                except Exception as e2:
+                    print(f"[WARN] Telegram sendMessage gagal (plain): {e2}")
+                    return False
             print(f"[WARN] Telegram sendMessage gagal: {e}")
             return False
 
     def send_photo(self, photo_path: str, caption: str = "",
                    parse_mode: str = "HTML") -> bool:
-        """Send a PNG/JPG photo with optional caption."""
+        """Send a PNG/JPG photo with caption. Falls back to no parse_mode on error."""
         try:
             with open(photo_path, "rb") as f:
                 self._post("sendPhoto", data={
                     "chat_id": self.chat_id,
-                    "caption": caption[:1024],   # Telegram caption limit
+                    "caption": caption[:1024],
                     "parse_mode": parse_mode,
                 }, files={"photo": f})
             return True
         except Exception as e:
-            print(f"[WARN] Telegram sendPhoto gagal ({os.path.basename(photo_path)}): {e}")
+            err_str = str(e)
+            if "400" in err_str and parse_mode:
+                # Retry without HTML formatting
+                try:
+                    import re
+                    plain_cap = re.sub(r"<[^>]+>", "", caption)[:1024]
+                    with open(photo_path, "rb") as f:
+                        self._post("sendPhoto", data={
+                            "chat_id": self.chat_id,
+                            "caption": plain_cap,
+                        }, files={"photo": f})
+                    return True
+                except Exception as e2:
+                    print(f"[WARN] sendPhoto plain gagal: {e2}")
+            print(f"[WARN] Telegram sendPhoto gagal "
+                  f"({os.path.basename(photo_path)}): {e}")
             return False
 
     # ------------------------------------------------------------------
@@ -92,92 +130,57 @@ class TelegramSender:
 
     def send_summary(self, df: pd.DataFrame, timeframe: str,
                      total_scanned: int = 0) -> bool:
-        """Send the scan summary as a formatted HTML message."""
-        tf_label = {"1d": "Daily", "1wk": "Weekly", "4h": "H4"}.get(timeframe, timeframe.upper())
+        """Send scan summary as formatted HTML message."""
+        tf_label = {"1d": "Daily", "1wk": "Weekly", "4h": "H4"}.get(
+            timeframe, timeframe.upper())
 
         if df.empty:
             msg = (
-                f"<b>PRZ Scanner - {tf_label}</b>\n"
+                f"<b>PRZ Scanner - {_e(tf_label)}</b>\n"
                 f"Tidak ada saham yang mendekati PRZ BUY zone saat ini."
             )
             return self.send_message(msg)
 
         lines = [
-            f"<b>PRZ Scanner - {tf_label}</b>",
+            f"<b>PRZ Scanner - {_e(tf_label)}</b>",
             f"<i>{len(df)} saham mendekati PRZ BUY zone"
-            + (f" (dari {total_scanned} discan)" if total_scanned else "") + "</i>",
+            + (f" (dari {_e(total_scanned)} discan)" if total_scanned else "")
+            + "</i>",
             "",
         ]
 
-        for i, row in df.iterrows():
-            inside = row.get("Zone", "") == "INSIDE"
-            status_icon = "🟢" if inside else "🟡"
-            valid_icon = "✅" if row.get("Valid", "") == "valid" else "⚠️"
-            arrow = "⬇️" if row.get("Dist%", 0) > 0 else "📍"
+        for _, row in df.iterrows():
+            inside = str(row.get("Zone", "")) == "INSIDE"
+            valid  = str(row.get("Valid", "")) == "valid"
+            dist   = float(row.get("Dist%", 0))
+
+            status_icon = "\U0001f7e2" if inside else "\U0001f7e1"   # 🟢 🟡
+            valid_icon  = "\u2705" if valid else "\u26a0\ufe0f"       # ✅ ⚠️
+            arrow       = "\U0001f4cd" if inside else "\U0001f53d"    # 📍 🔽
+
+            try:
+                prz_lo  = float(row.get("PRZ_low", 0))
+                prz_hi  = float(row.get("PRZ_high", 0))
+                close   = float(row.get("Close", 0))
+                score   = float(row.get("Score", 0))
+                tp1     = float(row.get("TP1", 0))
+                stop    = float(row.get("Stop", 0))
+            except (ValueError, TypeError):
+                continue
 
             lines.append(
-                f"{status_icon} <b>{row['Ticker']}</b> — {row['Pattern']} "
-                f"({row.get('Tol','')}) {valid_icon}\n"
-                f"   PRZ: <code>{row['PRZ_low']:.0f}–{row['PRZ_high']:.0f}</code>  "
-                f"Close: <code>{row['Close']:.0f}</code>  "
-                f"{arrow} <code>{row.get('Dist%', 0):.1f}%</code>\n"
-                f"   Score: <code>{row.get('Score',0):.0f}</code>  "
-                f"TP1: <code>{row.get('TP1',0):.0f}</code>  "
-                f"Stop: <code>{row.get('Stop',0):.0f}</code>"
+                f"{status_icon} <b>{_e(row['Ticker'])}</b> - "
+                f"{_e(row['Pattern'])} ({_e(row.get('Tol', ''))}) {valid_icon}\n"
+                f"  PRZ: <code>{prz_lo:.0f}-{prz_hi:.0f}</code>  "
+                f"Close: <code>{close:.0f}</code>  "
+                f"{arrow} <code>{dist:.1f}%</code>\n"
+                f"  Score: <code>{score:.0f}</code>  "
+                f"TP1: <code>{tp1:.0f}</code>  "
+                f"Stop: <code>{stop:.0f}</code>"
             )
 
         msg = "\n".join(lines)
-        # Telegram message limit 4096 chars
-        if len(msg) > 4096:
-            msg = msg[:4050] + "\n\n<i>...truncated</i>"
+        if len(msg) > 4000:
+            msg = msg[:3950] + "\n\n<i>...truncated</i>"
 
         return self.send_message(msg)
-
-    def send_results(self, results: List[StockResult], df: pd.DataFrame,
-                     timeframe: str, total_scanned: int = 0,
-                     pause: float = 1.5) -> int:
-        """Send summary + all chart PNGs. Returns count of photos sent."""
-        tf_label = {"1d": "Daily", "1wk": "Weekly", "4h": "H4"}.get(timeframe, timeframe.upper())
-        print(f"  [TG] Mengirim summary ke Telegram...")
-        self.send_summary(df, timeframe, total_scanned)
-        time.sleep(0.5)
-
-        sent = 0
-        for r in results:
-            if r.best_buy is None:
-                continue
-            bb = r.best_buy
-            inside = bb.prz_lo <= float(r.df["Close"].iloc[-1]) <= bb.prz_hi
-            status = "INSIDE PRZ" if inside else f"approaching ({bb.dist_pct:.1f}%)"
-            valid_str = "valid" if bb.valid else "INVALID"
-            caption = (
-                f"<b>{r.ticker}</b> | {tf_label} | {bb.pattern} | {valid_str}\n"
-                f"PRZ: {bb.prz_lo:.0f} - {bb.prz_hi:.0f}\n"
-                f"Close: {float(r.df['Close'].iloc[-1]):.0f} | {status}\n"
-                f"Score: {bb.score:.0f} | TP1: {bb.tp1:.0f} | Stop: {bb.stop:.0f}"
-            )
-            # Find chart file - it may have just been saved to out_dir
-            import glob
-            from datetime import datetime
-            date = datetime.now().strftime("%Y%m%d")
-            # Try to find matching PNG
-            pattern_glob = os.path.join(r.df.attrs.get("out_dir", ""), f"{r.ticker}_*_{date}.png")
-            matches = []
-            if hasattr(r, "_chart_path") and r._chart_path:
-                matches = [r._chart_path]
-            if not matches:
-                # Search common output dirs
-                for base in ["output/daily", "output/weekly", "output/h4", "output"]:
-                    g = glob.glob(os.path.join(base, f"{r.ticker}_*_{date}.png"))
-                    matches.extend(g)
-            if matches:
-                chart_path = max(matches, key=os.path.getmtime)
-                print(f"  [TG] Mengirim chart {r.ticker}...")
-                ok = self.send_photo(chart_path, caption)
-                if ok:
-                    sent += 1
-                time.sleep(pause)
-            else:
-                print(f"  [TG] Chart {r.ticker} tidak ditemukan, skip foto.")
-
-        return sent
