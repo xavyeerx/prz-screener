@@ -37,7 +37,7 @@ def _get_tv():
     global _TV
     if _TV is None:
         try:
-            _TV = TvDatafeed(auto_login=False)
+            _TV = TvDatafeed()
         except Exception as e:
             print(f"[FATAL] Gagal inisialisasi TvDatafeed: {e}")
     return _TV
