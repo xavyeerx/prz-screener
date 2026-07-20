@@ -12,6 +12,7 @@ Validated behaviour for .JK tickers on yfinance:
 """
 
 import time
+import random
 from typing import Dict, Optional
 import pandas as pd
 
@@ -47,6 +48,49 @@ def _normalize(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df if len(df) > 0 else None
 
 
+_RATE_LIMIT_ERRS = ("Too Many Requests", "Rate limited", "YFRateLimitError", "429")
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    return any(s in str(exc) for s in _RATE_LIMIT_ERRS)
+
+
+def _download_with_retry(yt: str, period: str, interval: str,
+                         retries: int = 3) -> Optional[pd.DataFrame]:
+    """yf.download() with exponential backoff on rate-limit errors.
+    Wait schedule: 10s, 30s, 60s (+ up to 5s jitter each time).
+    """
+    waits = [10, 30, 60]
+    for attempt in range(retries):
+        try:
+            df = yf.download(yt, period=period, interval=interval,
+                             auto_adjust=False, progress=False)
+            return df
+        except Exception as e:
+            if _is_rate_limit(e) and attempt < retries - 1:
+                wait = waits[attempt] + random.uniform(0, 5)
+                print(f"[RATE-LIMIT] {yt} — tunggu {wait:.0f}s lalu retry "
+                      f"({attempt+1}/{retries-1})...")
+                time.sleep(wait)
+            else:
+                raise
+    return None
+
+
+def _ticker_history_fallback(yt: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    """Fallback: pakai Ticker.history() jika yf.download() masih rate-limited."""
+    try:
+        t = yf.Ticker(yt)
+        df = t.history(period=period, interval=interval, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        # Ticker.history() pakai kolom Adj Close bukan Adj Close terpisah
+        df = df.rename(columns={"Stock Splits": "Splits"}, errors="ignore")
+        return df
+    except Exception:
+        return None
+
+
 def fetch_one(code: str, cfg: Config) -> Optional[pd.DataFrame]:
     """Fetch a single ticker's OHLC for the configured timeframe.
 
@@ -54,38 +98,52 @@ def fetch_one(code: str, cfg: Config) -> Optional[pd.DataFrame]:
       '1d'  — Daily bars, ~2 years history.
       '1wk' — Weekly bars, ~5 years history (native yfinance interval).
       '4h'  — 4-hour bars via 60m fetch + resample, ~60 days history.
+
+    Rate limiting strategy (penting untuk VPS):
+      1. yf.download() dengan retry + exponential backoff (10s, 30s, 60s)
+      2. Jika masih gagal -> fallback ke Ticker.history()
     """
     if yf is None:
         raise RuntimeError("yfinance not installed. pip install yfinance")
     yt = ticker_to_yf(code)
+
+    def _fetch(period: str, interval: str) -> Optional[pd.DataFrame]:
+        """Try download with retry, then fallback to Ticker.history()."""
+        try:
+            df = _download_with_retry(yt, period, interval)
+            result = _normalize(df)
+            if result is not None:
+                return result
+        except Exception as e:
+            print(f"[WARN] download failed {code} after retries: {e}")
+        # Fallback
+        print(f"[FALLBACK] {code}: mencoba Ticker.history()...")
+        df2 = _ticker_history_fallback(yt, period, interval)
+        return _normalize(df2)
+
     try:
         if cfg.timeframe == "1d":
-            df = yf.download(yt, period=cfg.period_daily, interval="1d",
-                             auto_adjust=False, progress=False)
-            return _normalize(df)
+            return _fetch(cfg.period_daily, "1d")
 
         elif cfg.timeframe == "1wk":
-            # Weekly is a native yfinance interval — no resampling needed.
-            # period_weekly gives ~5 years = ~260 weekly candles.
-            df = yf.download(yt, period=cfg.period_weekly, interval="1wk",
-                             auto_adjust=False, progress=False)
-            return _normalize(df)
+            return _fetch(cfg.period_weekly, "1wk")
 
         else:  # "4h" -> fetch 60m and resample
-            df = yf.download(yt, period=cfg.period_intraday, interval="60m",
-                             auto_adjust=False, progress=False)
-            df = _normalize(df)
+            df = _fetch(cfg.period_intraday, "60m")
             if df is None:
                 return None
             return _resample_4h(df)
 
-    except Exception as e:  # network / delisted / empty
+    except Exception as e:
         print(f"[WARN] fetch failed {code}: {e}")
         return None
 
 
-def fetch_all(cfg: Config, pause: float = 0.4) -> Dict[str, pd.DataFrame]:
-    """Fetch every ticker in the watchlist. Skips failures, never crashes."""
+def fetch_all(cfg: Config, pause: float = 1.5) -> Dict[str, pd.DataFrame]:
+    """Fetch every ticker in the watchlist. Skips failures, never crashes.
+
+    pause=1.5s default (lebih lambat tapi aman di VPS — kurangi rate-limit error).
+    """
     out: Dict[str, pd.DataFrame] = {}
     for code in cfg.watchlist:
         df = fetch_one(code, cfg)
@@ -93,7 +151,7 @@ def fetch_all(cfg: Config, pause: float = 0.4) -> Dict[str, pd.DataFrame]:
             out[code] = df
         else:
             print(f"[SKIP] {code}: no/insufficient data")
-        time.sleep(pause)   # gentle rate-limit for 45 tickers
+        time.sleep(pause + random.uniform(0, 0.5))  # jitter agar tidak terlihat bot
     return out
 
 
