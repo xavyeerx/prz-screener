@@ -31,6 +31,7 @@ class StockResult:
     all_dets: List[Detection]      # every detection (buy+sell) for charting
     best_buy: Optional[Detection]  # ranked best bullish for summary
     passed: bool
+    realtime_close: Optional[float] = None  # harga real-time (5m delayed), None jika tidak tersedia
 
 
 def _dedup(dets: List[Detection]) -> List[Detection]:
@@ -45,11 +46,16 @@ def _dedup(dets: List[Detection]) -> List[Detection]:
     return list(seen.values())
 
 
-def scan_stock(ticker: str, df: pd.DataFrame, cfg: Config) -> StockResult:
+def scan_stock(ticker: str, df: pd.DataFrame, cfg: Config,
+               realtime_price: Optional[float] = None) -> StockResult:
+    """Scan one stock. realtime_price overrides last candle close for proximity
+    check & display — pattern detection always uses the full historical array."""
     high = df["High"].to_numpy(dtype=float)
     low = df["Low"].to_numpy(dtype=float)
     close = df["Close"].to_numpy(dtype=float)
-    last_close = close[-1]
+    # Pakai harga real-time untuk proximity & display jika tersedia.
+    # Pattern detection (zigzag, XABCD) tetap pakai seluruh array historis.
+    last_close = realtime_price if realtime_price is not None else close[-1]
 
     dets: List[Detection] = []
     tol_passes = []
@@ -94,14 +100,21 @@ def scan_stock(ticker: str, df: pd.DataFrame, cfg: Config) -> StockResult:
         best_buy = sorted(buy_candidates, key=rank)[0]
 
     return StockResult(ticker=ticker, df=df, all_dets=dets,
-                       best_buy=best_buy, passed=passed)
+                       best_buy=best_buy, passed=passed,
+                       realtime_close=realtime_price)
 
 
-def scan_watchlist(data: Dict[str, pd.DataFrame], cfg: Config) -> List[StockResult]:
+def scan_watchlist(data: Dict[str, pd.DataFrame], cfg: Config,
+                   realtime_prices: Dict[str, float] = None) -> List[StockResult]:
+    """Scan all tickers. realtime_prices dict {ticker -> price} overrides
+    last candle close for proximity check and display."""
+    if realtime_prices is None:
+        realtime_prices = {}
     results = []
     for ticker, df in data.items():
         try:
-            res = scan_stock(ticker, df, cfg)
+            rt_price = realtime_prices.get(ticker)
+            res = scan_stock(ticker, df, cfg, realtime_price=rt_price)
             if res.passed:
                 results.append(res)
         except Exception as e:
@@ -109,7 +122,6 @@ def scan_watchlist(data: Dict[str, pd.DataFrame], cfg: Config) -> List[StockResu
     # order: inside-PRZ first, then nearest, then score
     def order(r: StockResult):
         d = r.best_buy
-        inside = d.prz_lo <= d.prz_mid  # placeholder; use dist
         return (abs(d.dist_pct), -d.score)
     results.sort(key=order)
     return results

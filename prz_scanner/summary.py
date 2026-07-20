@@ -27,9 +27,12 @@ def build_summary(results: List[StockResult], timeframe: str) -> pd.DataFrame:
     rows = []
     for r in results:
         d = r.best_buy
-        last_close = float(r.df["Close"].iloc[-1])
+        # Pakai harga real-time jika tersedia, fallback ke candle close historis
+        last_close = r.realtime_close if r.realtime_close is not None \
+            else float(r.df["Close"].iloc[-1])
         inside = d.prz_lo <= last_close <= d.prz_hi
         gap = 0.0 if inside else (last_close - d.prz_hi) / d.prz_hi * 100
+
         rows.append({
             "Ticker": r.ticker,
             "Pattern": d.pattern,

@@ -5,7 +5,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from prz_scanner.config import weekly_config
-from prz_scanner.data_fetch import fetch_all
+from prz_scanner.data_fetch import fetch_all, fetch_realtime_prices
 from prz_scanner.scanner import scan_watchlist
 from prz_scanner.chart_render import render_chart
 from prz_scanner.summary import build_summary, write_summary
@@ -81,12 +81,18 @@ def main(argv=None):
     data = fetch_all(cfg)
     print(f"      got data for {len(data)} ticker(s)")
 
+    n_tickers = len(data)
+    print(f"      Fetching real-time prices ({n_tickers} tickers)...")
+    realtime_prices = fetch_realtime_prices(list(data.keys()))
+    rt_hit = sum(1 for c in data if c in realtime_prices)
+    print(f"      Real-time prices: {rt_hit}/{n_tickers} tickers OK")
+
     if not data:
         print("[ERROR] Tidak ada data yang berhasil di-fetch.")
         return 1
 
     print("\n[2/4] Scanning harmonic PRZ buy zones (Weekly)...")
-    results = scan_watchlist(data, cfg)
+    results = scan_watchlist(data, cfg, realtime_prices=realtime_prices)
     print(f"      {len(results)} saham lolos proximity filter")
 
     print("\n[3/4] Menulis summary...")
@@ -142,7 +148,7 @@ def main(argv=None):
                     print(f"  [TG] Chart {r.ticker} tidak ada, skip.")
                     continue
                 bb = r.best_buy
-                last_close = float(r.df["Close"].iloc[-1])
+                last_close = r.realtime_close if r.realtime_close is not None else float(r.df["Close"].iloc[-1])
                 inside = bb.prz_lo <= last_close <= bb.prz_hi
                 status = "INSIDE PRZ" if inside else f"approaching {bb.dist_pct:.1f}%"
                 caption = (

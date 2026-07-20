@@ -95,3 +95,63 @@ def fetch_all(cfg: Config, pause: float = 0.4) -> Dict[str, pd.DataFrame]:
             print(f"[SKIP] {code}: no/insufficient data")
         time.sleep(pause)   # gentle rate-limit for 45 tickers
     return out
+
+
+def fetch_realtime_prices(codes: list, pause: float = 0.0) -> Dict[str, float]:
+    """Fetch the latest traded price for each ticker (real-time / ~5min delayed).
+
+    Menggunakan interval '5m' period '1d' agar mendapatkan harga terkini,
+    bukan harga close dari candle harian/weekly/H4 yang mungkin sudah stale.
+
+    Ini penting untuk timeframe Weekly & Daily: candle terakhir belum tentu
+    mencerminkan harga saat ini (misal Weekly close = Jumat lalu, padahal
+    hari ini sudah ada pergerakan baru).
+
+    Returns dict {code -> latest_price}. Ticker yang gagal tidak dimasukkan.
+    """
+    if yf is None:
+        return {}
+    if not codes:
+        return {}
+
+    prices: Dict[str, float] = {}
+
+    # Batch download lebih efisien untuk banyak ticker
+    # Gunakan period='2d' agar dapat data hari ini sekalipun market baru saja buka
+    yt_codes = [ticker_to_yf(c) for c in codes]
+    try:
+        df = yf.download(
+            yt_codes, period="2d", interval="5m",
+            auto_adjust=False, progress=False, group_by="ticker"
+        )
+        if df is None or df.empty:
+            return prices
+
+        for code, yt in zip(codes, yt_codes):
+            try:
+                if isinstance(df.columns, pd.MultiIndex):
+                    # Multi-ticker: kolom = (ticker, OHLCV)
+                    closes = df[yt]["Close"].dropna()
+                else:
+                    # Single ticker — df langsung flat
+                    closes = df["Close"].dropna()
+                if len(closes) > 0:
+                    prices[code] = float(closes.iloc[-1])
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] fetch_realtime_prices batch failed: {e}")
+        # Fallback: coba satu-satu dengan fast_info
+        for code in codes:
+            try:
+                yt = ticker_to_yf(code)
+                t = yf.Ticker(yt)
+                fi = t.fast_info
+                p = fi.get("lastPrice") or fi.get("previousClose")
+                if p:
+                    prices[code] = float(p)
+            except Exception:
+                pass
+
+    return prices
+
