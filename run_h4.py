@@ -35,6 +35,8 @@ def parse_args(argv=None):
                    help="kirim hasil ke grup Telegram (butuh .env dengan TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID)")
     p.add_argument("--tg-token", default=None, help="override Telegram bot token")
     p.add_argument("--tg-chat", default=None, help="override Telegram chat_id")
+    p.add_argument("--cleanup", action="store_true",
+                   help="hapus PNG & skip simpan summary ke disk setelah kirim ke Telegram")
     return p.parse_args(argv)
 
 

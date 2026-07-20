@@ -37,6 +37,8 @@ def parse_args(argv=None):
                    help="saat --telegram: kirim PNG saja, skip pesan teks summary")
     p.add_argument("--tg-token", default=None, help="override Telegram bot token")
     p.add_argument("--tg-chat", default=None, help="override Telegram chat_id")
+    p.add_argument("--cleanup", action="store_true",
+                   help="hapus PNG & skip simpan summary ke disk setelah kirim ke Telegram")
     return p.parse_args(argv)
 
 
@@ -99,8 +101,11 @@ def main(argv=None):
 
     print("\n[3/4] Menulis summary...")
     df = build_summary(results, cfg.timeframe)
-    csv_path, txt_path = write_summary(df, cfg.output_dir)
-    print(f"      -> {csv_path}")
+    if not (args.cleanup and args.telegram):
+        csv_path, txt_path = write_summary(df, cfg.output_dir)
+        print(f"      -> {csv_path}")
+    else:
+        print("      (--cleanup aktif: summary tidak disimpan ke disk)")
     if not df.empty:
         print("\n" + df.to_string(index=False) + "\n")
     else:
@@ -164,8 +169,14 @@ def main(argv=None):
                     f"TP1: <code>{bb.tp1:.0f}</code>  Stop: <code>{bb.stop:.0f}</code>"
                 )
                 print(f"  [TG] Mengirim {r.ticker}...")
-                tg.send_photo(path, caption)
-                sent += 1
+                ok = tg.send_photo(path, caption)
+                if ok:
+                    sent += 1
+                    if args.cleanup:
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
                 _time.sleep(1.5)
             print(f"  [TG] {sent} chart(s) terkirim.")
         except Exception as e:

@@ -53,7 +53,7 @@ def _run(script: str, label: str):
     log.info(f"{'='*50}")
     log.info(f"START: {label}")
     log.info(f"{'='*50}")
-    cmd = [PYTHON, os.path.join(BASE_DIR, script), "--telegram", "--images-only"]
+    cmd = [PYTHON, os.path.join(BASE_DIR, script), "--telegram", "--images-only", "--cleanup"]
     try:
         result = subprocess.run(
             cmd,
