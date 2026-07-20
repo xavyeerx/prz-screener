@@ -1,0 +1,19 @@
+# PRZ Scanner - Crontab Configuration
+# ====================================
+# Alternatif scheduler berbasis cron Linux (lebih ringan dari scheduler.py).
+#
+# Setup:
+#   crontab -e
+#   (paste baris di bawah, sesuaikan PATH jika perlu)
+#
+# PENTING: Pastikan timezone VPS = Asia/Jakarta:
+#   sudo timedatectl set-timezone Asia/Jakarta
+#
+# Format: menit jam hari bulan hari-minggu perintah
+# hari-minggu: 1=Senin, 2=Selasa, ..., 5=Jumat
+
+# Daily scan - Senin s.d. Jumat jam 18:00 WIB
+0 18 * * 1-5 cd ~/prz-screener && python3 run_daily.py --telegram --images-only >> logs/daily.log 2>&1
+
+# Weekly scan - Jumat jam 18:05 WIB (setelah daily selesai)
+5 18 * * 5   cd ~/prz-screener && python3 run_weekly.py --telegram --images-only >> logs/weekly.log 2>&1

@@ -1,0 +1,512 @@
+//@version=5
+indicator("Harmonic PRZ Scanner", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=100)
+
+// ============================================================
+// INPUTS
+// ============================================================
+grp_t = "Tolerance"
+tol1 = input.float(5, "Strict %", minval=1, maxval=10, step=0.5, group=grp_t)
+tol2 = input.float(10, "Loose %", minval=5, maxval=20, step=0.5, group=grp_t)
+en_t1 = input.bool(true, "Enable Strict", group=grp_t)
+en_t2 = input.bool(true, "Enable Loose", group=grp_t)
+
+grp_d = "Depth (on/off)"
+en_d3  = input.bool(true,  "Depth 3",  group=grp_d)
+en_d5  = input.bool(true,  "Depth 5",  group=grp_d)
+en_d8  = input.bool(true,  "Depth 8",  group=grp_d)
+en_d12 = input.bool(true,  "Depth 12", group=grp_d)
+en_d18 = input.bool(false, "Depth 18", group=grp_d)
+en_d20 = input.bool(true,  "Depth 20", group=grp_d)
+en_d25 = input.bool(false, "Depth 25", group=grp_d)
+
+grp_p = "Patterns"
+en_g = input.bool(true, "Gartley", group=grp_p)
+en_b = input.bool(true, "Bat", group=grp_p)
+en_c = input.bool(true, "Crab", group=grp_p)
+en_f = input.bool(true, "Butterfly", group=grp_p)
+en_s = input.bool(true, "Shark", group=grp_p)
+
+grp_v = "Visuals"
+show_prz = input.bool(true, "Show PRZ Box", group=grp_v)
+show_lines = input.bool(true, "Show Lines", group=grp_v)
+show_lbl = input.bool(true, "Show Labels", group=grp_v)
+max_dist = input.float(80, "Max PRZ Distance %", minval=10, maxval=500, step=10, group=grp_v, tooltip="Hanya tampilkan PRZ dalam jarak N% dari harga saat ini")
+show_hist  = input.bool(true,  "Show Confirmed Reversals", group=grp_v, tooltip="Tampilkan PRZ lama yang sudah terbukti reversal SESUAI arah pola (tag ✓, warna pudar)")
+show_flip  = input.bool(true,  "Show Flipped PRZ", group=grp_v, tooltip="Tampilkan PRZ yang ter-FLIP: pola memprediksi reversal turun tapi harga malah reversal naik (atau sebaliknya). Zona ini biasanya berubah jadi support/resistance baru. Tag ⚠FLIP.")
+rev_bars   = input.int(5, "Reversal Confirm Bars", minval=2, maxval=20, group=grp_v, tooltip="Jumlah candle setelah harga menyentuh PRZ untuk konfirmasi reversal")
+strict_bc  = input.bool(false, "Strict BC Projection", group=grp_p, tooltip="ON = wajibkan BC projection sesuai aturan Carney (pola sedikit tapi akurat). OFF = deteksi lebih banyak, termasuk bottom yang BC-nya di luar rentang ideal. Default OFF.")
+
+// ============================================================
+// OBJECT STORAGE — semua line/box/label disimpan agar bisa dihapus
+// & digambar ulang tiap rekalkulasi (mencegah penumpukan & garis statis)
+// ============================================================
+var line[]  store_lines = array.new_line(0)
+var box[]   store_boxes = array.new_box(0)
+var label[] store_labels = array.new_label(0)
+
+clearAll() =>
+    while array.size(store_lines) > 0
+        line.delete(array.pop(store_lines))
+    while array.size(store_boxes) > 0
+        box.delete(array.pop(store_boxes))
+    while array.size(store_labels) > 0
+        label.delete(array.pop(store_labels))
+
+// ============================================================
+// HELPERS
+// ============================================================
+safeDiv(a, b) => b != 0 ? a / b : 0.0
+inR(v, ideal, t) => v >= ideal*(1-t/100) and v <= ideal*(1+t/100)
+inMM(v, lo, hi, t) => v >= lo*(1-t/100) and v <= hi*(1+t/100)
+// BC projection gate: kalau strict_bc OFF, selalu lolos; kalau ON, cek rentang.
+bcGate(v, lo, hi, t) => not strict_bc or inMM(v, lo, hi, t)
+
+// ============================================================
+// PRZ STATUS — reaksi harga nyata di zona PRZ
+// Mengembalikan:
+//   0 = aktif (belum disentuh, atau disentuh tapi belum cukup bar)
+//   1 = reversal CONFIRMED searah pola (bull→naik / bear→turun)
+//   2 = invalid: ditembus searah dengan ekspektasi pola (gagal hold)
+//   3 = FLIP: harga reversal BERLAWANAN arah pola
+//       (pola bull tapi harga jatuh & balik turun dari zona = zona jadi resistance,
+//        pola bear tapi harga naik tembus & balik naik dari zona = zona jadi support)
+// ============================================================
+// Mengembalikan [status, endTime]:
+//   endTime = waktu bar terakhir yang masih berinteraksi dengan zona
+//             (sentuhan terakhir, atau bar saat reversal/flip terkonfirmasi).
+//             Dipakai untuk menentukan ujung kanan box agar hanya selebar area tersentuh.
+// Mengembalikan [status, firstTouch, endTime]:
+//   firstTouch = waktu candle PERTAMA yang menyentuh zona (sisi kiri box).
+//                = 0 bila zona belum pernah disentuh.
+//   endTime    = waktu candle terakhir yang masih berinteraksi (sisi kanan box).
+przStatus(przHi, przLo, isBull, startTime) =>
+    int result = 0
+    bool touched = false
+    bool broke = false        // sudah menembus zona berlawanan ekspektasi?
+    int touchIdx = 0
+    int firstTouch = 0
+    int endTime = startTime
+    int lookback = math.min(bar_index, 500)
+    // scan dari pivot D (lama) maju ke sekarang: pakai indeks menurun
+    for k = 0 to lookback
+        int i = lookback - k
+        if time[i] <= startTime
+            continue
+        float h = high[i]
+        float l = low[i]
+        float c = close[i]
+        if not touched
+            // sentuhan pertama: harga masuk ke dalam rentang zona
+            if l <= przHi and h >= przLo
+                touched := true
+                touchIdx := i
+                firstTouch := time[i]
+                endTime := time[i]
+        else
+            // perbarui ujung selama harga masih menyentuh zona
+            if l <= przHi and h >= przLo
+                endTime := time[i]
+            int barsSince = touchIdx - i
+            if isBull
+                // CONFIRMED: harga balik naik di atas zona sesuai ekspektasi bullish
+                if barsSince >= rev_bars and c > przHi
+                    result := broke ? 3 : 1   // kalau sebelumnya sempat tembus ke bawah = FLIP
+                    endTime := time[i]
+                    break
+                // tembus ke bawah zona (berlawanan ekspektasi)
+                if c < przLo * 0.97
+                    broke := true
+                    endTime := time[i]
+            else
+                // CONFIRMED: harga balik turun di bawah zona sesuai ekspektasi bearish
+                if barsSince >= rev_bars and c < przLo
+                    result := broke ? 3 : 1
+                    endTime := time[i]
+                    break
+                // tembus ke atas zona (berlawanan ekspektasi)
+                if c > przHi * 1.03
+                    broke := true
+                    endTime := time[i]
+    // Sudah menembus tapi tidak pernah balik (tidak ada konfirmasi) = INVALID
+    if broke and result == 0
+        result := 2
+    [result, firstTouch, endTime]
+
+// ============================================================
+// ZIGZAG D3
+// ============================================================
+var float[] p3p = array.new_float(0), var int[] p3b = array.new_int(0), var bool[] p3t = array.new_bool(0)
+ph3 = ta.pivothigh(high,3,3)
+pl3 = ta.pivotlow(low,3,3)
+if not na(ph3)
+    int sz = array.size(p3t)
+    if sz > 0
+        if array.get(p3t,sz-1)==true
+            if ph3 > array.get(p3p,sz-1)
+                array.set(p3p,sz-1,ph3), array.set(p3b,sz-1,time[3])
+        else
+            array.push(p3p,ph3), array.push(p3b,time[3]), array.push(p3t,true)
+    else
+        array.push(p3p,ph3), array.push(p3b,time[3]), array.push(p3t,true)
+if not na(pl3)
+    int sz = array.size(p3t)
+    if sz > 0
+        if array.get(p3t,sz-1)==false
+            if pl3 < array.get(p3p,sz-1)
+                array.set(p3p,sz-1,pl3), array.set(p3b,sz-1,time[3])
+        else
+            array.push(p3p,pl3), array.push(p3b,time[3]), array.push(p3t,false)
+    else
+        array.push(p3p,pl3), array.push(p3b,time[3]), array.push(p3t,false)
+while array.size(p3p)>20
+    array.shift(p3p), array.shift(p3b), array.shift(p3t)
+
+// ============================================================
+// ZIGZAG D5
+// ============================================================
+var float[] p5p = array.new_float(0), var int[] p5b = array.new_int(0), var bool[] p5t = array.new_bool(0)
+ph5 = ta.pivothigh(high,5,5)
+pl5 = ta.pivotlow(low,5,5)
+if not na(ph5)
+    int sz = array.size(p5t)
+    if sz > 0
+        if array.get(p5t,sz-1)==true
+            if ph5 > array.get(p5p,sz-1)
+                array.set(p5p,sz-1,ph5), array.set(p5b,sz-1,time[5])
+        else
+            array.push(p5p,ph5), array.push(p5b,time[5]), array.push(p5t,true)
+    else
+        array.push(p5p,ph5), array.push(p5b,time[5]), array.push(p5t,true)
+if not na(pl5)
+    int sz = array.size(p5t)
+    if sz > 0
+        if array.get(p5t,sz-1)==false
+            if pl5 < array.get(p5p,sz-1)
+                array.set(p5p,sz-1,pl5), array.set(p5b,sz-1,time[5])
+        else
+            array.push(p5p,pl5), array.push(p5b,time[5]), array.push(p5t,false)
+    else
+        array.push(p5p,pl5), array.push(p5b,time[5]), array.push(p5t,false)
+while array.size(p5p)>20
+    array.shift(p5p), array.shift(p5b), array.shift(p5t)
+
+// ============================================================
+// ZIGZAG D8
+// ============================================================
+var float[] p8p = array.new_float(0), var int[] p8b = array.new_int(0), var bool[] p8t = array.new_bool(0)
+ph8 = ta.pivothigh(high,8,8)
+pl8 = ta.pivotlow(low,8,8)
+if not na(ph8)
+    int sz = array.size(p8t)
+    if sz > 0
+        if array.get(p8t,sz-1)==true
+            if ph8 > array.get(p8p,sz-1)
+                array.set(p8p,sz-1,ph8), array.set(p8b,sz-1,time[8])
+        else
+            array.push(p8p,ph8), array.push(p8b,time[8]), array.push(p8t,true)
+    else
+        array.push(p8p,ph8), array.push(p8b,time[8]), array.push(p8t,true)
+if not na(pl8)
+    int sz = array.size(p8t)
+    if sz > 0
+        if array.get(p8t,sz-1)==false
+            if pl8 < array.get(p8p,sz-1)
+                array.set(p8p,sz-1,pl8), array.set(p8b,sz-1,time[8])
+        else
+            array.push(p8p,pl8), array.push(p8b,time[8]), array.push(p8t,false)
+    else
+        array.push(p8p,pl8), array.push(p8b,time[8]), array.push(p8t,false)
+while array.size(p8p)>20
+    array.shift(p8p), array.shift(p8b), array.shift(p8t)
+
+// ============================================================
+// ZIGZAG D12
+// ============================================================
+var float[] p12p = array.new_float(0), var int[] p12b = array.new_int(0), var bool[] p12t = array.new_bool(0)
+ph12 = ta.pivothigh(high,12,12)
+pl12 = ta.pivotlow(low,12,12)
+if not na(ph12)
+    int sz = array.size(p12t)
+    if sz > 0
+        if array.get(p12t,sz-1)==true
+            if ph12 > array.get(p12p,sz-1)
+                array.set(p12p,sz-1,ph12), array.set(p12b,sz-1,time[12])
+        else
+            array.push(p12p,ph12), array.push(p12b,time[12]), array.push(p12t,true)
+    else
+        array.push(p12p,ph12), array.push(p12b,time[12]), array.push(p12t,true)
+if not na(pl12)
+    int sz = array.size(p12t)
+    if sz > 0
+        if array.get(p12t,sz-1)==false
+            if pl12 < array.get(p12p,sz-1)
+                array.set(p12p,sz-1,pl12), array.set(p12b,sz-1,time[12])
+        else
+            array.push(p12p,pl12), array.push(p12b,time[12]), array.push(p12t,false)
+    else
+        array.push(p12p,pl12), array.push(p12b,time[12]), array.push(p12t,false)
+while array.size(p12p)>20
+    array.shift(p12p), array.shift(p12b), array.shift(p12t)
+
+// ============================================================
+// ZIGZAG D18
+// ============================================================
+var float[] p18p = array.new_float(0), var int[] p18b = array.new_int(0), var bool[] p18t = array.new_bool(0)
+ph18 = ta.pivothigh(high,18,18)
+pl18 = ta.pivotlow(low,18,18)
+if not na(ph18)
+    int sz = array.size(p18t)
+    if sz > 0
+        if array.get(p18t,sz-1)==true
+            if ph18 > array.get(p18p,sz-1)
+                array.set(p18p,sz-1,ph18), array.set(p18b,sz-1,time[18])
+        else
+            array.push(p18p,ph18), array.push(p18b,time[18]), array.push(p18t,true)
+    else
+        array.push(p18p,ph18), array.push(p18b,time[18]), array.push(p18t,true)
+if not na(pl18)
+    int sz = array.size(p18t)
+    if sz > 0
+        if array.get(p18t,sz-1)==false
+            if pl18 < array.get(p18p,sz-1)
+                array.set(p18p,sz-1,pl18), array.set(p18b,sz-1,time[18])
+        else
+            array.push(p18p,pl18), array.push(p18b,time[18]), array.push(p18t,false)
+    else
+        array.push(p18p,pl18), array.push(p18b,time[18]), array.push(p18t,false)
+while array.size(p18p)>20
+    array.shift(p18p), array.shift(p18b), array.shift(p18t)
+
+// ============================================================
+// ZIGZAG D20
+// ============================================================
+var float[] p20p = array.new_float(0), var int[] p20b = array.new_int(0), var bool[] p20t = array.new_bool(0)
+ph20 = ta.pivothigh(high,20,20)
+pl20 = ta.pivotlow(low,20,20)
+if not na(ph20)
+    int sz = array.size(p20t)
+    if sz > 0
+        if array.get(p20t,sz-1)==true
+            if ph20 > array.get(p20p,sz-1)
+                array.set(p20p,sz-1,ph20), array.set(p20b,sz-1,time[20])
+        else
+            array.push(p20p,ph20), array.push(p20b,time[20]), array.push(p20t,true)
+    else
+        array.push(p20p,ph20), array.push(p20b,time[20]), array.push(p20t,true)
+if not na(pl20)
+    int sz = array.size(p20t)
+    if sz > 0
+        if array.get(p20t,sz-1)==false
+            if pl20 < array.get(p20p,sz-1)
+                array.set(p20p,sz-1,pl20), array.set(p20b,sz-1,time[20])
+        else
+            array.push(p20p,pl20), array.push(p20b,time[20]), array.push(p20t,false)
+    else
+        array.push(p20p,pl20), array.push(p20b,time[20]), array.push(p20t,false)
+while array.size(p20p)>20
+    array.shift(p20p), array.shift(p20b), array.shift(p20t)
+
+// ============================================================
+// ZIGZAG D25
+// ============================================================
+var float[] p25p = array.new_float(0), var int[] p25b = array.new_int(0), var bool[] p25t = array.new_bool(0)
+ph25 = ta.pivothigh(high,25,25)
+pl25 = ta.pivotlow(low,25,25)
+if not na(ph25)
+    int sz = array.size(p25t)
+    if sz > 0
+        if array.get(p25t,sz-1)==true
+            if ph25 > array.get(p25p,sz-1)
+                array.set(p25p,sz-1,ph25), array.set(p25b,sz-1,time[25])
+        else
+            array.push(p25p,ph25), array.push(p25b,time[25]), array.push(p25t,true)
+    else
+        array.push(p25p,ph25), array.push(p25b,time[25]), array.push(p25t,true)
+if not na(pl25)
+    int sz = array.size(p25t)
+    if sz > 0
+        if array.get(p25t,sz-1)==false
+            if pl25 < array.get(p25p,sz-1)
+                array.set(p25p,sz-1,pl25), array.set(p25b,sz-1,time[25])
+        else
+            array.push(p25p,pl25), array.push(p25b,time[25]), array.push(p25t,false)
+    else
+        array.push(p25p,pl25), array.push(p25b,time[25]), array.push(p25t,false)
+while array.size(p25p)>20
+    array.shift(p25p), array.shift(p25b), array.shift(p25t)
+
+// ============================================================
+// DRAW PRZ — menggambar zona setelah cek status reaksi harga.
+// Mengembalikan: false jika pola di-skip (invalid/disembunyikan), true jika digambar.
+// ============================================================
+drawPRZ(przHi, przLo, bull, ci, pname, clr, isStrict, xi, xP, ai, aP, bi, bP, cP) =>
+    bool drawn = false
+    [status, firstTouch, endTime] = przStatus(przHi, przLo, bull, ci)
+    bool isHist = status == 1
+    bool isFlip = status == 3
+    bool touched = firstTouch > 0
+    bool skip = status == 2 or (isHist and not show_hist) or (isFlip and not show_flip)
+    if not skip
+        int barMs = time - time[1]
+        // sisi kiri box = sentuhan pertama harga ke zona.
+        // Bila belum pernah tersentuh, mulai dari titik C dengan lebar minimal 3 bar.
+        int ps = touched ? firstTouch : ci
+        int pe = touched ? endTime + barMs : ci + 3 * barMs
+        int bw = isStrict ? 2 : 1
+        // warna & transparansi sesuai status
+        color zclr = isFlip ? color.yellow : clr
+        int boxTransp = isFlip ? 85 : (isHist ? 92 : (isStrict ? 80 : 90))
+        int borderTransp = isFlip ? 20 : (isHist ? 70 : 40)
+        string style = isFlip ? line.style_solid : (isStrict ? line.style_solid : line.style_dashed)
+        int borderW = isFlip ? bw + 1 : bw
+        string pfix = isStrict ? "★ " : "☆ "
+        string dir = bull ? "▲" : "▼"
+        string tag = isFlip ? " ⚠FLIP" : (isHist ? " ✓" : "")
+        if show_prz
+            array.push(store_boxes, box.new(ps, przHi, pe, przLo, xloc=xloc.bar_time, border_color=color.new(zclr, borderTransp), bgcolor=color.new(zclr, boxTransp), border_width=borderW, border_style=style))
+        if show_lbl
+            array.push(store_labels, label.new(ps, przHi, pfix + dir + pname + " " + str.tostring(przLo, "#") + "-" + str.tostring(przHi, "#") + tag, xloc=xloc.bar_time, style=label.style_label_down, color=color.new(zclr, isFlip ? 40 : 60), textcolor=color.white, size=size.tiny))
+        if show_lines
+            string lsty = (isHist or isFlip) ? line.style_dotted : line.style_solid
+            array.push(store_lines, line.new(xi, xP, ai, aP, xloc=xloc.bar_time, color=zclr, width=bw, style=lsty))
+            array.push(store_lines, line.new(ai, aP, bi, bP, xloc=xloc.bar_time, color=zclr, width=bw, style=lsty))
+            array.push(store_lines, line.new(bi, bP, ci, cP, xloc=xloc.bar_time, color=zclr, width=bw, style=lsty))
+        drawn := true
+    drawn
+
+scan(pp, bb, tt, tolVal, isStrict) =>
+    int cnt = 0
+    int totalP = array.size(pp)
+    if totalP >= 5
+        int maxW = math.min(3, totalP - 4)
+        for w = 0 to maxW
+            int idx = totalP - 4 - w
+            if idx >= 0
+                float xP = array.get(pp, idx)
+                float aP = array.get(pp, idx+1)
+                float bP = array.get(pp, idx+2)
+                float cP = array.get(pp, idx+3)
+                int xi = array.get(bb, idx)
+                int ai = array.get(bb, idx+1)
+                int bi = array.get(bb, idx+2)
+                int ci = array.get(bb, idx+3)
+                bool xHi = array.get(tt, idx)
+                bool bull = not xHi
+                bool a1 = array.get(tt, idx) != array.get(tt, idx+1)
+                bool a2 = array.get(tt, idx+1) != array.get(tt, idx+2)
+                bool a3 = array.get(tt, idx+2) != array.get(tt, idx+3)
+                if a1 and a2 and a3
+                    float xa = math.abs(aP-xP)
+                    float ab = math.abs(bP-aP)
+                    float bc = math.abs(cP-bP)
+                    float br = safeDiv(ab,xa)   // B retracement of XA
+                    float cr = safeDiv(bc,ab)   // C retracement of AB
+                    float bcp = safeDiv(bc,ab)  // BC projection
+
+                    // ---- GARTLEY: B=0.618 XA, D=0.786 XA, BC proj 1.13–1.618 ----
+                    if en_g and inR(br,0.618,tolVal) and inMM(cr,0.382,0.886,tolVal) and bcGate(bcp,1.13,1.618,tolVal)
+                        float gd = bull ? aP-0.786*xa : aP+0.786*xa
+                        float gr = xa*0.03
+                        float ghi = gd+gr, float glo = gd-gr
+                        if math.abs((gd-close)/close)*100 <= max_dist and glo > 0
+                            if drawPRZ(ghi, glo, bull, ci, "Gartley", color.green, isStrict, xi, xP, ai, aP, bi, bP, cP)
+                                cnt+=1
+
+                    // ---- BAT: B=0.382–0.50 XA, D=0.886 XA, BC proj 1.618–2.618 ----
+                    if en_b and inMM(br,0.382,0.50,tolVal) and inMM(cr,0.382,0.886,tolVal) and bcGate(bcp,1.618,2.618,tolVal)
+                        float bd = bull ? aP-0.886*xa : aP+0.886*xa
+                        float brr = xa*0.03
+                        float bhi = bd+brr, float blo = bd-brr
+                        if math.abs((bd-close)/close)*100 <= max_dist and blo > 0
+                            if drawPRZ(bhi, blo, bull, ci, "Bat", color.blue, isStrict, xi, xP, ai, aP, bi, bP, cP)
+                                cnt+=1
+
+                    // ---- BUTTERFLY: B=0.786 XA, D=1.27 XA, BC proj 1.618–2.24 ----
+                    if en_f and inR(br,0.786,tolVal) and inMM(cr,0.382,0.886,tolVal) and bcGate(bcp,1.618,2.24,tolVal)
+                        float fd = bull ? aP-1.27*xa : aP+1.27*xa
+                        float fr = xa*0.04
+                        float fhi = fd+fr, float flo = fd-fr
+                        if math.abs((fd-close)/close)*100 <= max_dist and flo > 0
+                            if drawPRZ(fhi, flo, bull, ci, "Butterfly", color.purple, isStrict, xi, xP, ai, aP, bi, bP, cP)
+                                cnt+=1
+
+                    // ---- CRAB: B=0.382–0.618 XA, D=1.618 XA, BC proj 2.24–3.618 ----
+                    if en_c and inMM(br,0.382,0.618,tolVal) and inMM(cr,0.382,0.886,tolVal) and bcGate(bcp,2.24,3.618,tolVal)
+                        float cd = bull ? aP-1.618*xa : aP+1.618*xa
+                        float crr = xa*0.05
+                        float chi = cd+crr, float clo = cd-crr
+                        if math.abs((cd-close)/close)*100 <= max_dist and clo > 0
+                            if drawPRZ(chi, clo, bull, ci, "Crab", color.orange, isStrict, xi, xP, ai, aP, bi, bP, cP)
+                                cnt+=1
+
+                    // ---- SHARK: B=0.382–0.618 XC, D=0.886–1.13 XA, BC proj 1.13–1.618 ----
+                    if en_s and inMM(br,0.382,0.618,tolVal) and bcp>=1.13*(1-tolVal/100) and bcGate(bcp,1.13,1.618,tolVal)
+                        float su  = bull ? aP-0.886*xa : aP+0.886*xa
+                        float sl2 = bull ? aP-1.13*xa  : aP+1.13*xa
+                        float shi = math.max(su,sl2), float slo = math.min(su,sl2)
+                        float smid = (shi+slo)/2
+                        if math.abs((smid-close)/close)*100 <= max_dist and slo > 0
+                            if drawPRZ(shi, slo, bull, ci, "Shark", color.red, isStrict, xi, xP, ai, aP, bi, bP, cP)
+                                cnt+=1
+    cnt
+// ============================================================
+// RUN ALL SCANS
+// ============================================================
+if barstate.islast
+    clearAll()
+    if en_d3 and en_t1
+        scan(p3p,p3b,p3t,tol1,true)
+    if en_d3 and en_t2
+        scan(p3p,p3b,p3t,tol2,false)
+    if en_d5 and en_t1
+        scan(p5p,p5b,p5t,tol1,true)
+    if en_d5 and en_t2
+        scan(p5p,p5b,p5t,tol2,false)
+    if en_d8 and en_t1
+        scan(p8p,p8b,p8t,tol1,true)
+    if en_d8 and en_t2
+        scan(p8p,p8b,p8t,tol2,false)
+    if en_d12 and en_t1
+        scan(p12p,p12b,p12t,tol1,true)
+    if en_d12 and en_t2
+        scan(p12p,p12b,p12t,tol2,false)
+    if en_d18 and en_t1
+        scan(p18p,p18b,p18t,tol1,true)
+    if en_d18 and en_t2
+        scan(p18p,p18b,p18t,tol2,false)
+    if en_d20 and en_t1
+        scan(p20p,p20b,p20t,tol1,true)
+    if en_d20 and en_t2
+        scan(p20p,p20b,p20t,tol2,false)
+    if en_d25 and en_t1
+        scan(p25p,p25b,p25t,tol1,true)
+    if en_d25 and en_t2
+        scan(p25p,p25b,p25t,tol2,false)
+
+// ============================================================
+// LEGEND
+// ============================================================
+var table lg = table.new(position.bottom_right,2,10,bgcolor=color.new(color.black,80),border_width=1)
+if barstate.islast
+    table.cell(lg,0,0,"★ Strict",text_color=color.white,text_size=size.tiny)
+    table.cell(lg,1,0,str.tostring(tol1)+"%",text_color=color.white,text_size=size.tiny)
+    table.cell(lg,0,1,"☆ Loose",text_color=color.gray,text_size=size.tiny)
+    table.cell(lg,1,1,str.tostring(tol2)+"%",text_color=color.gray,text_size=size.tiny)
+    table.cell(lg,0,2,"Gartley",text_color=color.green,text_size=size.tiny)
+    table.cell(lg,1,2,"D=0.786",text_color=color.green,text_size=size.tiny)
+    table.cell(lg,0,3,"Bat",text_color=color.blue,text_size=size.tiny)
+    table.cell(lg,1,3,"D=0.886",text_color=color.blue,text_size=size.tiny)
+    table.cell(lg,0,4,"Butterfly",text_color=color.purple,text_size=size.tiny)
+    table.cell(lg,1,4,"D=1.27",text_color=color.purple,text_size=size.tiny)
+    table.cell(lg,0,5,"Crab",text_color=color.orange,text_size=size.tiny)
+    table.cell(lg,1,5,"D=1.618",text_color=color.orange,text_size=size.tiny)
+    table.cell(lg,0,6,"Shark",text_color=color.red,text_size=size.tiny)
+    table.cell(lg,1,6,"D=0.886-1.13",text_color=color.red,text_size=size.tiny)
+    table.cell(lg,0,7,"▲▼ Aktif",text_color=color.white,text_size=size.tiny)
+    table.cell(lg,1,7,"✓Reversal ⚠FLIP",text_color=color.yellow,text_size=size.tiny)
+    table.cell(lg,0,8,"FLIP",text_color=color.yellow,text_size=size.tiny)
+    table.cell(lg,1,8,"jadi S/R baru",text_color=color.yellow,text_size=size.tiny)
+    table.cell(lg,0,9,"Depth",text_color=color.gray,text_size=size.tiny)
+    table.cell(lg,1,9,"3/5/8/12/18/20/25",text_color=color.gray,text_size=size.tiny)
+
+alertcondition(close>0,"Check PRZ","Cek PRZ {{ticker}}")
