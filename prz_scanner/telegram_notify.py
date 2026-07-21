@@ -97,13 +97,14 @@ class TelegramSender:
     def send_photo(self, photo_path: str, caption: str = "",
                    parse_mode: str = "HTML") -> bool:
         """Send a PNG/JPG photo with caption. Falls back to no parse_mode on error."""
+        filename = os.path.basename(photo_path)
         try:
             with open(photo_path, "rb") as f:
                 self._post("sendPhoto", data={
                     "chat_id": self.chat_id,
                     "caption": caption[:1024],
                     "parse_mode": parse_mode,
-                }, files={"photo": f})
+                }, files={"photo": (filename, f)})
             return True
         except Exception as e:
             err_str = str(e)
@@ -116,12 +117,12 @@ class TelegramSender:
                         self._post("sendPhoto", data={
                             "chat_id": self.chat_id,
                             "caption": plain_cap,
-                        }, files={"photo": f})
+                        }, files={"photo": (filename, f)})
                     return True
                 except Exception as e2:
                     print(f"[WARN] sendPhoto plain gagal: {e2}")
             print(f"[WARN] Telegram sendPhoto gagal "
-                  f"({os.path.basename(photo_path)}): {e}")
+                  f"({filename}): {e}")
             return False
 
     # ------------------------------------------------------------------
