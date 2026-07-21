@@ -62,7 +62,7 @@ def _normalize(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df if len(df) > 0 else None
 
 
-def fetch_one(code: str, cfg: Config) -> Optional[pd.DataFrame]:
+def fetch_one(code: str, cfg: Config, retries: int = 3) -> Optional[pd.DataFrame]:
     """Fetch a single ticker's OHLC from TradingView."""
     tv = _get_tv()
     if tv is None:
@@ -80,12 +80,23 @@ def fetch_one(code: str, cfg: Config) -> Optional[pd.DataFrame]:
         interval = Interval.in_4_hour
         n_bars = 500  # ~500 bar 4H cukup untuk zigzag depth 20
 
-    try:
-        df = tv.get_hist(symbol=code, exchange="IDX", interval=interval, n_bars=n_bars)
-        return _normalize(df)
-    except Exception as e:
-        print(f"[WARN] fetch failed {code}: {e}")
-        return None
+    for attempt in range(retries):
+        try:
+            df = tv.get_hist(symbol=code, exchange="IDX", interval=interval, n_bars=n_bars)
+            res = _normalize(df)
+            if res is not None:
+                return res
+                
+            # Jika hasil kosong/None (sering karena rate-limit sesaat), tunggu sejenak lalu coba lagi
+            if attempt < retries - 1:
+                time.sleep(1.5 + random.uniform(0, 1.0))
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(1.5 + random.uniform(0, 1.0))
+            else:
+                print(f"[WARN] fetch failed {code}: {e}")
+                
+    return None
 
 
 def fetch_all(cfg: Config, pause: float = 0.2) -> Dict[str, pd.DataFrame]:
